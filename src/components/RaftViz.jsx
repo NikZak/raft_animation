@@ -454,6 +454,91 @@ export default function RaftViz() {
     setInflight((p) => Math.max(0, p - 1));
   }, [addEvent, sendMsg]);
 
+  // ========== LOG CATCH-UP (leader replicates missing entries to recovered node) ==========
+  const syncFollower = useCallback(
+    async (nodeId) => {
+      const gen = genRef.current;
+      // Let React flush the recovery state update before we read nodesRef
+      await delay(400);
+      if (gen !== genRef.current) return;
+
+      const ns = nodesRef.current;
+      const follower = ns[nodeId];
+      if (!follower || follower.state === STATES.DOWN) return;
+
+      const leader = ns.find((n) => n.state === STATES.LEADER);
+      if (!leader) return;
+
+      const missingEntries = leader.log.filter(
+        (e) => !follower.log.find((fe) => fe.id === e.id),
+      );
+      const needsCommitUpdate = follower.log.some(
+        (e) =>
+          !e.committed && leader.log.find((le) => le.id === e.id && le.committed),
+      );
+
+      if (missingEntries.length === 0 && !needsCommitUpdate) return;
+
+      if (missingEntries.length > 0) {
+        addEvent(
+          `🔄 ${leader.name} → ${follower.name}: sending ${missingEntries.length} missing entr${missingEntries.length === 1 ? "y" : "ies"} (AppendEntries)`,
+        );
+        await delay(200);
+        if (gen !== genRef.current) return;
+      } else {
+        addEvent(
+          `💓 ${leader.name} → ${follower.name}: heartbeat with leaderCommit`,
+        );
+      }
+
+      await sendMsg(leader.id, nodeId, "AE", "bg-purple-400", 500);
+      if (gen !== genRef.current) return;
+      if (nodesRef.current[nodeId].state === STATES.DOWN) return;
+
+      // Capture leader's current log so we apply consistent data
+      const leaderLog = nodesRef.current[leader.id].log;
+
+      setNodes((prev) => {
+        const u = [...prev];
+        const curLog = [...u[nodeId].log];
+
+        for (const entry of leaderLog) {
+          if (!curLog.find((e) => e.id === entry.id)) {
+            curLog.push({ ...entry });
+          }
+        }
+
+        const finalLog = curLog
+          .map((e) => {
+            const leaderEntry = leaderLog.find((le) => le.id === e.id);
+            return leaderEntry?.committed ? { ...e, committed: true } : e;
+          })
+          .sort((a, b) => a.id - b.id);
+
+        u[nodeId] = {
+          ...u[nodeId],
+          log: finalLog,
+          commitIndex: calcCommitIndex(finalLog),
+        };
+        return u;
+      });
+
+      await sendMsg(nodeId, leader.id, "ACK", "bg-green-400", 300);
+      if (gen !== genRef.current) return;
+
+      const count = missingEntries.length;
+      const name = nodesRef.current[nodeId].name;
+      addEvent(
+        `✅ ${name} caught up — ${
+          count > 0
+            ? `applied ${count} missing entr${count === 1 ? "y" : "ies"}`
+            : "committed pending entries"
+        }`,
+      );
+    },
+    [addEvent, sendMsg],
+  );
+
   // ========== CRASH / RECOVER ==========
   const crashNode = useCallback(
     (id) => {
@@ -471,6 +556,9 @@ export default function RaftViz() {
           return u;
         });
         addEvent(`🔄 ${cur.name} recovers as Follower`);
+        // Trigger leader catch-up: Raft leader detects the follower is behind
+        // and sends AppendEntries to bring its log up to date
+        syncFollower(id);
       } else {
         const wasLeader = cur.state === STATES.LEADER;
         setNodes((prev) => {
@@ -481,7 +569,7 @@ export default function RaftViz() {
         addEvent(`💥 ${cur.name} CRASHES${wasLeader ? " (was Leader!)" : ""}`);
       }
     },
-    [addEvent],
+    [addEvent, syncFollower],
   );
 
   // ========== RESET ==========
